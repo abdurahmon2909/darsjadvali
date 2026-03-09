@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import os
 import json
 
@@ -9,12 +10,18 @@ from aiogram.filters import Command
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import pytz
-tashkent_tz = pytz.timezone("Asia/Tashkent")
+
+# --------------------------------------------------
+# TIMEZONE
+# --------------------------------------------------
+TZ = ZoneInfo("Asia/Tashkent")
+
 # --------------------------------------------------
 # TELEGRAM
 # --------------------------------------------------
-BOT_TOKEN = "8378941872:AAHXIVVtjoHrYVZPTjwRczKHtZg2evZrn6I"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN o'zgaruvchisi topilmadi")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -65,23 +72,10 @@ feedback_sheet = spreadsheet.worksheet("Feedback")
 # --------------------------------------------------
 schedule_cache = {}
 
-# admin state:
-# {
-#   chat_id: {"mode": "class_select"},
-#   chat_id: {"mode": "class_message", "classes": ["8A", "8B"]},
-#   chat_id: {"mode": "all_message"}
-# }
+# admin state
 admin_broadcast_state = {}
 
-# feedback state:
-# {
-#   chat_id: {
-#       "step": "best" / "worst",
-#       "class": "8A",
-#       "subjects": ["Matematika", "Tarix"],
-#       "best": "Matematika"
-#   }
-# }
+# feedback state
 feedback_state = {}
 
 # --------------------------------------------------
@@ -106,6 +100,22 @@ ORDERED_DAYS = [
     "Shanba",
     "Yakshanba",
 ]
+
+# --------------------------------------------------
+# TIME HELPERS
+# --------------------------------------------------
+def now_tashkent():
+    return datetime.now(TZ)
+
+
+def next_target_time(hour: int, minute: int = 0):
+    now = now_tashkent()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if now >= target:
+        target += timedelta(days=1)
+
+    return target
 
 # --------------------------------------------------
 # USERS HELPERS
@@ -162,11 +172,6 @@ def get_all_users():
             })
     return result
 
-
-def get_users_by_class(target_class: str):
-    target_class = target_class.upper()
-    return [u for u in get_all_users() if u["class"] == target_class]
-
 # --------------------------------------------------
 # ADMINS HELPERS
 # --------------------------------------------------
@@ -222,14 +227,6 @@ def get_admin_allowed_classes(chat_id: int):
         return []
 
     return [c.strip().upper() for c in classes_raw.split(",") if c.strip()]
-
-
-def can_admin_send_to_class(chat_id: int, target_class: str) -> bool:
-    if is_superadmin(chat_id):
-        return True
-
-    allowed = get_admin_allowed_classes(chat_id)
-    return target_class.upper() in allowed
 
 # --------------------------------------------------
 # SCHEDULE CACHE HELPERS
@@ -311,7 +308,7 @@ def build_subject_keyboard(subjects):
 
 
 def save_feedback(chat_id, user_class, best, worst):
-    date = datetime.now(tashkent_tz).strftime("%Y-%m-%d")
+    date = now_tashkent().strftime("%Y-%m-%d")
     feedback_sheet.append_row([
         date,
         str(chat_id),
@@ -373,12 +370,12 @@ def format_weekly_schedule(user_class: str) -> str:
 
 
 def get_today_day_uz() -> str:
-    today_en = datetime.now(tashkent_tz).strftime("%A")
+    today_en = now_tashkent().strftime("%A")
     return DAY_MAP.get(today_en, today_en)
 
 
 def get_tomorrow_day_uz() -> str:
-    tomorrow_en = (datetime.now(tashkent_tz) + timedelta(days=1)).strftime("%A")
+    tomorrow_en = (now_tashkent() + timedelta(days=1)).strftime("%A")
     return DAY_MAP.get(tomorrow_en, tomorrow_en)
 
 # --------------------------------------------------
@@ -398,13 +395,8 @@ async def send_today_schedule():
     await asyncio.sleep(1)
 
     while True:
-        now = datetime.now(tashkent_tz)
-        target_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
-
-        if now >= target_time:
-            target_time += timedelta(days=1)
-
-        wait_seconds = (target_time - now).total_seconds()
+        target_time = next_target_time(7, 0)
+        wait_seconds = (target_time - now_tashkent()).total_seconds()
         await asyncio.sleep(wait_seconds)
 
         users = get_all_users()
@@ -426,13 +418,8 @@ async def send_daily_feedback_poll():
     await asyncio.sleep(1)
 
     while True:
-        now = datetime.now(tashkent_tz)
-        target = now.replace(hour=14, minute=0, second=0, microsecond=0)
-
-        if now >= target:
-            target += timedelta(days=1)
-
-        wait_seconds = (target - now).total_seconds()
+        target_time = next_target_time(14, 0)
+        wait_seconds = (target_time - now_tashkent()).total_seconds()
         await asyncio.sleep(wait_seconds)
 
         users = get_all_users()
@@ -469,13 +456,8 @@ async def send_tomorrow_schedule():
     await asyncio.sleep(1)
 
     while True:
-        now = datetime.now(tashkent_tz)
-        target_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
-
-        if now >= target_time:
-            target_time += timedelta(days=1)
-
-        wait_seconds = (target_time - now).total_seconds()
+        target_time = next_target_time(20, 0)
+        wait_seconds = (target_time - now_tashkent()).total_seconds()
         await asyncio.sleep(wait_seconds)
 
         users = get_all_users()
@@ -543,7 +525,7 @@ async def start_handler(message: types.Message):
     user_class = get_user_class(chat_id)
 
     if not user_class:
-        await message.answer("Assalomu alaykum! Marhamat, sinfingizni kiriting.\nMasalan: 5A, 7B, 10A")
+        await message.answer("Salom! Sinfingizni yozing.\nMasalan: 5A, 7B, 10A")
         return
 
     await message.answer(
@@ -564,7 +546,7 @@ async def admin_send_all_handler(message: types.Message):
     await message.answer("Barcha foydalanuvchilarga yuboriladigan xabarni kiriting.")
 
 
-@dp.message(Command("adminxabar"))
+@dp.message(Command("adminsendclass"))
 async def admin_send_class_handler(message: types.Message):
     chat_id = message.chat.id
 
@@ -573,7 +555,7 @@ async def admin_send_class_handler(message: types.Message):
         return
 
     if is_superadmin(chat_id):
-        await message.answer("Qaysi sinfga yubormoqchisiz?\nMasalan: 8A yoki 8A, 8B, 8V")
+        await message.answer("Qaysi sinfga yubormoqchisiz?\nMasalan: 8A yoki 8A,8B,8V")
     else:
         allowed = get_admin_allowed_classes(chat_id)
         if not allowed:
@@ -684,7 +666,7 @@ async def handle_message(message: types.Message):
             }
 
             await message.answer(
-                f"{', '.join(valid_classes)} sinfiga yuboriladigan xabarni kiriting."
+                f"{', '.join(valid_classes)} sinflariga yuboriladigan xabarni kiriting."
             )
             return
 
@@ -766,10 +748,15 @@ async def handle_message(message: types.Message):
 async def main():
     ensure_users_header()
     load_schedule_to_cache()
+
+    # agar webhook yoqilgan bo‘lsa, o‘chirib polling bilan ishga tushiramiz
+    await bot.delete_webhook(drop_pending_updates=False)
+
     asyncio.create_task(refresh_schedule_cache_every_hour())
     asyncio.create_task(send_today_schedule())
     asyncio.create_task(send_daily_feedback_poll())
     asyncio.create_task(send_tomorrow_schedule())
+
     await dp.start_polling(bot)
 
 
