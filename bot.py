@@ -9,7 +9,8 @@ from aiogram.filters import Command
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
+import pytz
+tashkent_tz = pytz.timezone("Asia/Tashkent")
 # --------------------------------------------------
 # TELEGRAM
 # --------------------------------------------------
@@ -310,7 +311,7 @@ def build_subject_keyboard(subjects):
 
 
 def save_feedback(chat_id, user_class, best, worst):
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = datetime.now(tashkent_tz).strftime("%Y-%m-%d")
     feedback_sheet.append_row([
         date,
         str(chat_id),
@@ -372,12 +373,12 @@ def format_weekly_schedule(user_class: str) -> str:
 
 
 def get_today_day_uz() -> str:
-    today_en = datetime.now().strftime("%A")
+    today_en = datetime.now(tashkent_tz).strftime("%A")
     return DAY_MAP.get(today_en, today_en)
 
 
 def get_tomorrow_day_uz() -> str:
-    tomorrow_en = (datetime.now() + timedelta(days=1)).strftime("%A")
+    tomorrow_en = (datetime.now(tashkent_tz) + timedelta(days=1)).strftime("%A")
     return DAY_MAP.get(tomorrow_en, tomorrow_en)
 
 # --------------------------------------------------
@@ -397,7 +398,7 @@ async def send_today_schedule():
     await asyncio.sleep(1)
 
     while True:
-        now = datetime.now()
+        now = datetime.now(tashkent_tz)
         target_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
 
         if now >= target_time:
@@ -425,7 +426,7 @@ async def send_daily_feedback_poll():
     await asyncio.sleep(1)
 
     while True:
-        now = datetime.now()
+        now = datetime.now(tashkent_tz)
         target = now.replace(hour=14, minute=0, second=0, microsecond=0)
 
         if now >= target:
@@ -468,7 +469,7 @@ async def send_tomorrow_schedule():
     await asyncio.sleep(1)
 
     while True:
-        now = datetime.now()
+        now = datetime.now(tashkent_tz)
         target_time = now.replace(hour=20, minute=0, second=0, microsecond=0)
 
         if now >= target_time:
