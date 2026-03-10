@@ -4,9 +4,13 @@ from zoneinfo import ZoneInfo
 import os
 import json
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from dotenv import load_dotenv
+load_dotenv()
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -25,22 +29,6 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-# --------------------------------------------------
-# UI UZBEK
-# --------------------------------------------------
-BTN_TODAY = "Bugungi dars jadvali"
-BTN_TOMORROW = "Ertangi dars jadvali"
-BTN_WEEKLY = "Haftalik dars jadvali"
-
-kb_main = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_TODAY)],
-        [KeyboardButton(text=BTN_TOMORROW)],
-        [KeyboardButton(text=BTN_WEEKLY)]
-    ],
-    resize_keyboard=True
-)
 
 # --------------------------------------------------
 # GOOGLE SHEETS
@@ -68,15 +56,17 @@ admins_sheet = spreadsheet.worksheet("Admins")
 feedback_sheet = spreadsheet.worksheet("Feedback")
 
 # --------------------------------------------------
-# CACHE
+# CACHE / STATE
 # --------------------------------------------------
 schedule_cache = {}
+users_cache = {}
+admins_cache = {}
 
-# admin state
 admin_broadcast_state = {}
-
-# feedback state
 feedback_state = {}
+registration_state = {}
+
+FEEDBACK_STATE_FILE = "feedback_state.json"
 
 # --------------------------------------------------
 # DAYS
@@ -108,14 +98,22 @@ def now_tashkent():
     return datetime.now(TZ)
 
 
-def next_target_time(hour: int, minute: int = 0):
-    now = now_tashkent()
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+def today_date_str():
+    return now_tashkent().strftime("%Y-%m-%d")
 
-    if now >= target:
-        target += timedelta(days=1)
 
-    return target
+def current_time_str():
+    return now_tashkent().strftime("%H:%M")
+
+
+def get_today_day_uz() -> str:
+    today_en = now_tashkent().strftime("%A")
+    return DAY_MAP.get(today_en, today_en)
+
+
+def get_tomorrow_day_uz() -> str:
+    tomorrow_en = (now_tashkent() + timedelta(days=1)).strftime("%A")
+    return DAY_MAP.get(tomorrow_en, tomorrow_en)
 
 # --------------------------------------------------
 # USERS HELPERS
@@ -132,15 +130,33 @@ def ensure_users_header():
         users_sheet.insert_row(["chat_id", "class"], 1)
 
 
-def get_user_class(chat_id: int):
-    rows = users_sheet.get_all_values()
-    if len(rows) <= 1:
-        return None
+def load_users_to_cache():
+    global users_cache
 
-    for row in rows[1:]:
-        if len(row) >= 2 and row[0].strip() == str(chat_id):
-            return row[1].strip()
-    return None
+    rows = users_sheet.get_all_values()
+    new_cache = {}
+
+    if len(rows) > 1:
+        for row in rows[1:]:
+            if len(row) >= 2:
+                chat_id = row[0].strip()
+                user_class = row[1].strip().upper()
+
+                if chat_id and user_class:
+                    new_cache[chat_id] = {
+                        "chat_id": chat_id,
+                        "class": user_class
+                    }
+
+    users_cache = new_cache
+    print("Users cache yangilandi")
+
+
+def get_user_class(chat_id: int):
+    user = users_cache.get(str(chat_id))
+    if not user:
+        return None
+    return user["class"]
 
 
 def save_user_class(chat_id: int, user_class: str):
@@ -150,59 +166,61 @@ def save_user_class(chat_id: int, user_class: str):
         users_sheet.append_row(["chat_id", "class"])
         rows = users_sheet.get_all_values()
 
+    updated = False
+
     for index, row in enumerate(rows[1:], start=2):
         if len(row) >= 1 and row[0].strip() == str(chat_id):
             users_sheet.update(f"A{index}:B{index}", [[str(chat_id), user_class]])
-            return
+            updated = True
+            break
 
-    users_sheet.append_row([str(chat_id), user_class])
+    if not updated:
+        users_sheet.append_row([str(chat_id), user_class])
+
+    users_cache[str(chat_id)] = {
+        "chat_id": str(chat_id),
+        "class": user_class.upper()
+    }
 
 
 def get_all_users():
-    rows = users_sheet.get_all_values()
-    if len(rows) <= 1:
-        return []
-
-    result = []
-    for row in rows[1:]:
-        if len(row) >= 2 and row[0].strip() and row[1].strip():
-            result.append({
-                "chat_id": row[0].strip(),
-                "class": row[1].strip().upper()
-            })
-    return result
+    return list(users_cache.values())
 
 # --------------------------------------------------
 # ADMINS HELPERS
 # --------------------------------------------------
-def get_admins_data():
+def load_admins_to_cache():
+    global admins_cache
+
     rows = admins_sheet.get_all_values()
-    if len(rows) <= 1:
-        return []
+    new_cache = {}
 
-    result = []
-    for row in rows[1:]:
-        if len(row) < 2:
-            continue
+    if len(rows) > 1:
+        for row in rows[1:]:
+            if len(row) < 2:
+                continue
 
-        chat_id = row[0].strip()
-        role = row[1].strip().lower()
-        classes = row[2].strip() if len(row) >= 3 else ""
+            chat_id = row[0].strip()
+            role = row[1].strip().lower()
+            classes = row[2].strip() if len(row) >= 3 else ""
 
-        result.append({
-            "chat_id": chat_id,
-            "role": role,
-            "classes": classes
-        })
-    return result
+            if chat_id:
+                new_cache[chat_id] = {
+                    "chat_id": chat_id,
+                    "role": role,
+                    "classes": classes
+                }
+
+    admins_cache = new_cache
+    print("Admins cache yangilandi")
+
+
+def get_admins_data():
+    return list(admins_cache.values())
 
 
 def get_admin_info(chat_id: int):
-    chat_id = str(chat_id)
-    for admin in get_admins_data():
-        if admin["chat_id"] == chat_id:
-            return admin
-    return None
+    return admins_cache.get(str(chat_id))
 
 
 def is_superadmin(chat_id: int) -> bool:
@@ -279,6 +297,31 @@ def class_exists_in_schedule(user_class: str) -> bool:
 def get_existing_classes():
     return sorted(schedule_cache.keys())
 
+
+def get_parallel_numbers():
+    nums = set()
+    for class_name in schedule_cache.keys():
+        digits = ""
+        for ch in class_name:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            nums.add(digits)
+    return sorted(nums, key=lambda x: int(x))
+
+
+def get_letters_for_parallel(parallel: str):
+    letters = []
+    prefix = str(parallel)
+    for class_name in sorted(schedule_cache.keys()):
+        if class_name.startswith(prefix):
+            suffix = class_name[len(prefix):]
+            if suffix and suffix not in letters:
+                letters.append(suffix)
+    return letters
+
 # --------------------------------------------------
 # FEEDBACK HELPERS
 # --------------------------------------------------
@@ -296,17 +339,6 @@ def get_unique_subjects_for_today(user_class: str):
     return subjects
 
 
-def build_subject_keyboard(subjects):
-    keyboard = []
-    for subject in subjects:
-        keyboard.append([KeyboardButton(text=subject)])
-
-    return ReplyKeyboardMarkup(
-        keyboard=keyboard,
-        resize_keyboard=True
-    )
-
-
 def save_feedback(chat_id, user_class, best, worst):
     date = now_tashkent().strftime("%Y-%m-%d")
     feedback_sheet.append_row([
@@ -316,6 +348,52 @@ def save_feedback(chat_id, user_class, best, worst):
         best,
         worst
     ])
+
+# --------------------------------------------------
+# FEEDBACK STATE PERSISTENCE
+# --------------------------------------------------
+def load_feedback_state():
+    global feedback_state
+
+    if not os.path.exists(FEEDBACK_STATE_FILE):
+        feedback_state = {}
+        return
+
+    try:
+        with open(FEEDBACK_STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        restored = {}
+        for chat_id, state in raw.items():
+            restored[str(chat_id)] = state
+
+        feedback_state = restored
+        print("Feedback state yuklandi")
+    except Exception as e:
+        print(f"Feedback state yuklashda xatolik: {e}")
+        feedback_state = {}
+
+
+def save_feedback_state():
+    try:
+        with open(FEEDBACK_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(feedback_state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Feedback state saqlashda xatolik: {e}")
+
+
+def set_feedback_state(chat_id, state_data):
+    feedback_state[str(chat_id)] = state_data
+    save_feedback_state()
+
+
+def get_feedback_state(chat_id):
+    return feedback_state.get(str(chat_id))
+
+
+def remove_feedback_state(chat_id):
+    feedback_state.pop(str(chat_id), None)
+    save_feedback_state()
 
 # --------------------------------------------------
 # FORMAT HELPERS
@@ -368,18 +446,109 @@ def format_weekly_schedule(user_class: str) -> str:
 
     return "\n".join(response_parts).strip()
 
+# --------------------------------------------------
+# INLINE KEYBOARDS
+# --------------------------------------------------
+def kb_main_inline():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📘 Bugungi dars jadvali", callback_data="menu_today")],
+            [InlineKeyboardButton(text="📗 Ertangi dars jadvali", callback_data="menu_tomorrow")],
+            [InlineKeyboardButton(text="📚 Haftalik dars jadvali", callback_data="menu_weekly")],
+        ]
+    )
 
-def get_today_day_uz() -> str:
-    today_en = now_tashkent().strftime("%A")
-    return DAY_MAP.get(today_en, today_en)
+
+def kb_registration_numbers():
+    numbers = get_parallel_numbers()
+    rows = []
+
+    row = []
+    for num in numbers:
+        row.append(InlineKeyboardButton(text=num, callback_data=f"reg_num:{num}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def get_tomorrow_day_uz() -> str:
-    tomorrow_en = (now_tashkent() + timedelta(days=1)).strftime("%A")
-    return DAY_MAP.get(tomorrow_en, tomorrow_en)
+def kb_registration_letters(parallel: str):
+    letters = get_letters_for_parallel(parallel)
+    rows = []
+
+    row = []
+    for letter in letters:
+        full_class = f"{parallel}{letter}"
+        row.append(InlineKeyboardButton(text=letter, callback_data=f"reg_class:{full_class}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="reg_back_numbers")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_subjects_inline(subjects):
+    rows = []
+    for i, subject in enumerate(subjects):
+        rows.append([
+            InlineKeyboardButton(text=subject, callback_data=f"fb_subject:{i}")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_admin_classes_select(available_classes, selected_classes):
+    available_classes = sorted(set(available_classes))
+    selected_classes = sorted(set(selected_classes))
+
+    rows = []
+    row = []
+
+    for class_name in available_classes:
+        mark = "✅ " if class_name in selected_classes else ""
+        row.append(
+            InlineKeyboardButton(
+                text=f"{mark}{class_name}",
+                callback_data=f"admin_toggle_class:{class_name}"
+            )
+        )
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="✅ Tayyor", callback_data="admin_classes_done")])
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_cancel")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # --------------------------------------------------
-# BACKGROUND TASKS
+# SAFE EDIT / SEND HELPERS
+# --------------------------------------------------
+async def edit_or_send_message(target, text, reply_markup=None):
+    try:
+        if isinstance(target, types.CallbackQuery):
+            await target.message.edit_text(text, reply_markup=reply_markup)
+        else:
+            await target.answer(text, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        if isinstance(target, types.CallbackQuery):
+            await target.message.answer(text, reply_markup=reply_markup)
+        else:
+            await target.answer(text, reply_markup=reply_markup)
+
+# --------------------------------------------------
+# BACKGROUND CACHE REFRESH
 # --------------------------------------------------
 async def refresh_schedule_cache_every_hour():
     while True:
@@ -391,88 +560,211 @@ async def refresh_schedule_cache_every_hour():
         await asyncio.sleep(3600)
 
 
-async def send_today_schedule():
-    await asyncio.sleep(1)
-
+async def refresh_users_and_admins_cache_every_5_minutes():
     while True:
-        target_time = next_target_time(7, 0)
-        wait_seconds = (target_time - now_tashkent()).total_seconds()
-        await asyncio.sleep(wait_seconds)
+        try:
+            load_users_to_cache()
+            load_admins_to_cache()
+        except Exception as e:
+            print(f"Users/Admins cache yangilashda xatolik: {e}")
 
-        users = get_all_users()
-        today_day_uz = get_today_day_uz()
+        await asyncio.sleep(300)
 
-        for user in users:
-            chat_id = user["chat_id"]
-            user_class = user["class"]
+# --------------------------------------------------
+# RUN TASKS ONCE
+# --------------------------------------------------
+async def run_today_schedule():
+    users = get_all_users()
+    today_day_uz = get_today_day_uz()
 
-            try:
-                response = format_schedule_for_day(user_class, today_day_uz)
-                await bot.send_message(chat_id, response)
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                print(f"Bugungi jadval yuborishda xatolik {chat_id}: {e}")
+    for user in users:
+        chat_id = user["chat_id"]
+        user_class = user["class"]
+
+        try:
+            response = format_schedule_for_day(user_class, today_day_uz)
+            await bot.send_message(chat_id, response, reply_markup=kb_main_inline())
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"Bugungi jadval yuborishda xatolik {chat_id}: {e}")
 
 
-async def send_daily_feedback_poll():
-    await asyncio.sleep(1)
+async def run_feedback_poll():
+    users = get_all_users()
+    today = today_date_str()
 
-    while True:
-        target_time = next_target_time(14, 0)
-        wait_seconds = (target_time - now_tashkent()).total_seconds()
-        await asyncio.sleep(wait_seconds)
+    for user in users:
+        chat_id = user["chat_id"]
+        user_class = user["class"]
 
-        users = get_all_users()
+        subjects = get_unique_subjects_for_today(user_class)
 
-        for user in users:
-            chat_id = user["chat_id"]
-            user_class = user["class"]
+        if not subjects:
+            continue
 
-            subjects = get_unique_subjects_for_today(user_class)
+        set_feedback_state(chat_id, {
+            "step": "best",
+            "class": user_class,
+            "subjects": subjects,
+            "poll_date": today,
+            "reminded_18": False
+        })
+
+        try:
+            await bot.send_message(
+                chat_id,
+                "Bugun qaysi fan sizga eng yoqqan bo‘ldi?",
+                reply_markup=kb_subjects_inline(subjects)
+            )
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"Feedback poll yuborishda xatolik {chat_id}: {e}")
+
+
+async def run_feedback_reminder():
+    today = today_date_str()
+
+    for chat_id_str, state in list(feedback_state.items()):
+        try:
+            if state.get("poll_date") != today:
+                continue
+
+            if state.get("reminded_18") is True:
+                continue
+
+            subjects = state.get("subjects", [])
+            step = state.get("step", "best")
 
             if not subjects:
                 continue
 
-            keyboard = build_subject_keyboard(subjects)
-
-            feedback_state[chat_id] = {
-                "step": "best",
-                "class": user_class,
-                "subjects": subjects
-            }
-
-            try:
-                await bot.send_message(
-                    chat_id,
-                    "Bugun qaysi fan sizga eng yoqqan bo‘ldi?",
-                    reply_markup=keyboard
+            if step == "best":
+                text = (
+                    "⏰ Eslatma:\n"
+                    "Bugungi so‘rovnomaga hali javob bermadingiz.\n\n"
+                    "Bugun qaysi fan sizga eng yoqqan bo‘ldi?"
                 )
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                print(f"Feedback poll yuborishda xatolik {chat_id}: {e}")
+            else:
+                text = (
+                    "⏰ Eslatma:\n"
+                    "So‘rovnomaning ikkinchi qismiga hali javob bermadingiz.\n\n"
+                    "Bugun qaysi fan eng qiyin yoki yoqmagan bo‘ldi?"
+                )
+
+            await bot.send_message(
+                chat_id_str,
+                text,
+                reply_markup=kb_subjects_inline(subjects)
+            )
+
+            state["reminded_18"] = True
+            set_feedback_state(chat_id_str, state)
+
+            await asyncio.sleep(0.05)
+
+        except Exception as e:
+            print(f"Feedback reminder yuborishda xatolik {chat_id_str}: {e}")
 
 
-async def send_tomorrow_schedule():
-    await asyncio.sleep(1)
+async def close_expired_feedback_polls():
+    today = today_date_str()
+    to_remove = []
+
+    for chat_id_str, state in list(feedback_state.items()):
+        try:
+            poll_date = state.get("poll_date")
+
+            if poll_date != today:
+                try:
+                    await bot.send_message(
+                        chat_id_str,
+                        "🕛 Kechagi so‘rovnoma yopildi.",
+                        reply_markup=kb_main_inline()
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception as e:
+                    print(f"Feedback close notify xatolik {chat_id_str}: {e}")
+
+                to_remove.append(chat_id_str)
+
+        except Exception as e:
+            print(f"Feedback close check xatolik {chat_id_str}: {e}")
+
+    for chat_id_str in to_remove:
+        feedback_state.pop(str(chat_id_str), None)
+
+    if to_remove:
+        save_feedback_state()
+
+
+async def run_tomorrow_schedule():
+    users = get_all_users()
+    tomorrow_day_uz = get_tomorrow_day_uz()
+
+    for user in users:
+        chat_id = user["chat_id"]
+        user_class = user["class"]
+
+        try:
+            response = format_schedule_for_day(user_class, tomorrow_day_uz)
+            await bot.send_message(chat_id, response, reply_markup=kb_main_inline())
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"Ertangi jadval yuborishda xatolik {chat_id}: {e}")
+
+# --------------------------------------------------
+# STABLE SCHEDULER
+# --------------------------------------------------
+async def scheduler_loop():
+    last_run = {
+        "00": None,
+        "07": None,
+        "14": None,
+        "18": None,
+        "20": None
+    }
 
     while True:
-        target_time = next_target_time(20, 0)
-        wait_seconds = (target_time - now_tashkent()).total_seconds()
-        await asyncio.sleep(wait_seconds)
+        try:
+            now = now_tashkent()
+            hour = now.strftime("%H")
+            minute = now.strftime("%M")
+            today = now.strftime("%Y-%m-%d")
 
-        users = get_all_users()
-        tomorrow_day_uz = get_tomorrow_day_uz()
+            if hour == "00" and minute == "00":
+                if last_run["00"] != today:
+                    print("00:00 feedback close ishga tushdi")
+                    await close_expired_feedback_polls()
+                    last_run["00"] = today
 
-        for user in users:
-            chat_id = user["chat_id"]
-            user_class = user["class"]
+            if hour == "07" and minute == "00":
+                if last_run["07"] != today:
+                    print("07:00 task ishga tushdi")
+                    await run_today_schedule()
+                    last_run["07"] = today
 
-            try:
-                response = format_schedule_for_day(user_class, tomorrow_day_uz)
-                await bot.send_message(chat_id, response)
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                print(f"Ertangi jadval yuborishda xatolik {chat_id}: {e}")
+            if hour == "14" and minute == "00":
+                if last_run["14"] != today:
+                    print("14:00 task ishga tushdi")
+                    await run_feedback_poll()
+                    last_run["14"] = today
+
+            if hour == "18" and minute == "00":
+                if last_run["18"] != today:
+                    print("18:00 feedback reminder ishga tushdi")
+                    await run_feedback_reminder()
+                    last_run["18"] = today
+
+            if hour == "20" and minute == "00":
+                if last_run["20"] != today:
+                    print("20:00 task ishga tushdi")
+                    await run_tomorrow_schedule()
+                    last_run["20"] = today
+
+        except Exception as e:
+            print(f"Scheduler loop xatolik: {e}")
+
+        await asyncio.sleep(20)
 
 # --------------------------------------------------
 # SEND HELPERS
@@ -483,7 +775,11 @@ async def broadcast_to_all_users(text: str):
 
     for user in users:
         try:
-            await bot.send_message(user["chat_id"], f"📢 E'lon:\n\n{text}")
+            await bot.send_message(
+                user["chat_id"],
+                f"📢 E'lon:\n\n{text}",
+                reply_markup=kb_main_inline()
+            )
             sent_count += 1
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -505,7 +801,8 @@ async def broadcast_to_classes(target_classes, text: str):
             try:
                 await bot.send_message(
                     user["chat_id"],
-                    f"📢 {', '.join(target_classes)} sinflari uchun e'lon:\n\n{text}"
+                    f"📢 {', '.join(target_classes)} sinflari uchun e'lon:\n\n{text}",
+                    reply_markup=kb_main_inline()
                 )
                 sent_count += 1
                 await asyncio.sleep(0.05)
@@ -515,7 +812,7 @@ async def broadcast_to_classes(target_classes, text: str):
     return sent_count
 
 # --------------------------------------------------
-# HANDLERS
+# HANDLERS: START / REGISTRATION
 # --------------------------------------------------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
@@ -525,15 +822,21 @@ async def start_handler(message: types.Message):
     user_class = get_user_class(chat_id)
 
     if not user_class:
-        await message.answer("Salom! Sinfingizni yozing.\nMasalan: 5A, 7B, 10A")
+        registration_state[chat_id] = {"step": "choose_number"}
+        await message.answer(
+            "Salom! Sinfingizni tanlang:",
+            reply_markup=kb_registration_numbers()
+        )
         return
 
     await message.answer(
         f"Sizning sinfingiz: {user_class}\nKerakli bo‘limni tanlang:",
-        reply_markup=kb_main
+        reply_markup=kb_main_inline()
     )
 
-
+# --------------------------------------------------
+# HANDLERS: ADMIN COMMANDS
+# --------------------------------------------------
 @dp.message(Command("adminsendall"))
 async def admin_send_all_handler(message: types.Message):
     chat_id = message.chat.id
@@ -555,67 +858,313 @@ async def admin_send_class_handler(message: types.Message):
         return
 
     if is_superadmin(chat_id):
-        await message.answer("Qaysi sinfga yubormoqchisiz?\nMasalan: 8A yoki 8A,8B,8V")
+        available_classes = get_existing_classes()
     else:
         allowed = get_admin_allowed_classes(chat_id)
         if not allowed:
             await message.answer("Sizga birorta sinf biriktirilmagan.")
             return
-        await message.answer(
-            "Qaysi sinfga yubormoqchisiz?\n"
-            "Bir yoki bir nechta sinfni kiriting.\n"
-            f"Sizga ruxsat etilgan sinflar: {', '.join(allowed)}\n\n"
-            "Masalan: 8A yoki 8A,8B"
+        available_classes = [c for c in allowed if class_exists_in_schedule(c)]
+
+    if not available_classes:
+        await message.answer("Siz uchun tanlash mumkin bo‘lgan sinflar topilmadi.")
+        return
+
+    admin_broadcast_state[chat_id] = {
+        "mode": "class_select_inline",
+        "available_classes": available_classes,
+        "selected_classes": []
+    }
+
+    await message.answer(
+        "E'lon yuboriladigan sinflarni tanlang:",
+        reply_markup=kb_admin_classes_select(available_classes, [])
+    )
+
+# --------------------------------------------------
+# HANDLERS: CALLBACKS REGISTRATION
+# --------------------------------------------------
+@dp.callback_query(F.data == "reg_back_numbers")
+async def reg_back_numbers_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    registration_state[chat_id] = {"step": "choose_number"}
+
+    await callback.answer()
+    await edit_or_send_message(
+        callback,
+        "Sinfingizni tanlang:",
+        reply_markup=kb_registration_numbers()
+    )
+
+
+@dp.callback_query(F.data.startswith("reg_num:"))
+async def reg_num_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    parallel = callback.data.split(":", 1)[1]
+
+    registration_state[chat_id] = {
+        "step": "choose_letter",
+        "parallel": parallel
+    }
+
+    await callback.answer()
+    await edit_or_send_message(
+        callback,
+        f"{parallel}-sinf uchun harfni tanlang:",
+        reply_markup=kb_registration_letters(parallel)
+    )
+
+
+@dp.callback_query(F.data.startswith("reg_class:"))
+async def reg_class_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    selected_class = callback.data.split(":", 1)[1].upper()
+
+    await callback.answer()
+
+    if not class_exists_in_schedule(selected_class):
+        registration_state[chat_id] = {"step": "choose_number"}
+        await callback.message.answer(
+            f"{selected_class} sinfi uchun darslar hali qo‘shilmagan.",
+            reply_markup=kb_registration_numbers()
         )
+        return
 
-    admin_broadcast_state[chat_id] = {"mode": "class_select"}
+    save_user_class(chat_id, selected_class)
+    registration_state.pop(chat_id, None)
+
+    await edit_or_send_message(
+        callback,
+        f"{selected_class} sinfi saqlandi.\n"
+        f"Endi bot har kuni soat 07:00 da bugungi jadvalni, "
+        f"14:00 da so‘rovnomani, 18:00 da eslatmani va 20:00 da ertangi jadvalni yuboradi.\n"
+        f"So‘rovnoma esa 00:00 da yopiladi.",
+        reply_markup=kb_main_inline()
+    )
+
+# --------------------------------------------------
+# HANDLERS: CALLBACKS MAIN MENU
+# --------------------------------------------------
+@dp.callback_query(F.data == "menu_today")
+async def menu_today_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_class = get_user_class(chat_id)
+
+    await callback.answer()
+
+    if not user_class:
+        registration_state[chat_id] = {"step": "choose_number"}
+        await edit_or_send_message(
+            callback,
+            "Avval sinfingizni tanlang:",
+            reply_markup=kb_registration_numbers()
+        )
+        return
+
+    today_day_uz = get_today_day_uz()
+    response = format_schedule_for_day(user_class, today_day_uz)
+    await edit_or_send_message(callback, response, reply_markup=kb_main_inline())
 
 
+@dp.callback_query(F.data == "menu_tomorrow")
+async def menu_tomorrow_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_class = get_user_class(chat_id)
+
+    await callback.answer()
+
+    if not user_class:
+        registration_state[chat_id] = {"step": "choose_number"}
+        await edit_or_send_message(
+            callback,
+            "Avval sinfingizni tanlang:",
+            reply_markup=kb_registration_numbers()
+        )
+        return
+
+    tomorrow_day_uz = get_tomorrow_day_uz()
+    response = format_schedule_for_day(user_class, tomorrow_day_uz)
+    await edit_or_send_message(callback, response, reply_markup=kb_main_inline())
+
+
+@dp.callback_query(F.data == "menu_weekly")
+async def menu_weekly_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_class = get_user_class(chat_id)
+
+    await callback.answer()
+
+    if not user_class:
+        registration_state[chat_id] = {"step": "choose_number"}
+        await edit_or_send_message(
+            callback,
+            "Avval sinfingizni tanlang:",
+            reply_markup=kb_registration_numbers()
+        )
+        return
+
+    response = format_weekly_schedule(user_class)
+    await edit_or_send_message(callback, response, reply_markup=kb_main_inline())
+
+# --------------------------------------------------
+# HANDLERS: CALLBACKS FEEDBACK
+# --------------------------------------------------
+@dp.callback_query(F.data.startswith("fb_subject:"))
+async def feedback_subject_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    state = get_feedback_state(chat_id)
+
+    await callback.answer()
+
+    if not state:
+        await callback.message.answer(
+            "So‘rovnoma yopilgan yoki muddati tugagan.",
+            reply_markup=kb_main_inline()
+        )
+        return
+
+    if state.get("poll_date") != today_date_str():
+        remove_feedback_state(chat_id)
+        await callback.message.answer(
+            "So‘rovnoma yopilgan yoki muddati tugagan.",
+            reply_markup=kb_main_inline()
+        )
+        return
+
+    subjects = state.get("subjects", [])
+    idx_str = callback.data.split(":", 1)[1]
+
+    if not idx_str.isdigit():
+        return
+
+    idx = int(idx_str)
+    if idx < 0 or idx >= len(subjects):
+        return
+
+    selected_subject = subjects[idx]
+
+    if state["step"] == "best":
+        state["best"] = selected_subject
+        state["step"] = "worst"
+        set_feedback_state(chat_id, state)
+
+        await edit_or_send_message(
+            callback,
+            "Bugun qaysi fan eng qiyin yoki yoqmagan bo‘ldi?",
+            reply_markup=kb_subjects_inline(subjects)
+        )
+        return
+
+    if state["step"] == "worst":
+        best = state["best"]
+        worst = selected_subject
+        user_class = state["class"]
+
+        save_feedback(chat_id, user_class, best, worst)
+        remove_feedback_state(chat_id)
+
+        await edit_or_send_message(
+            callback,
+            "Rahmat! Sizning fikringiz saqlandi.",
+            reply_markup=kb_main_inline()
+        )
+        return
+
+# --------------------------------------------------
+# HANDLERS: CALLBACKS ADMIN
+# --------------------------------------------------
+@dp.callback_query(F.data == "admin_cancel")
+async def admin_cancel_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    admin_broadcast_state.pop(chat_id, None)
+
+    await callback.answer("Bekor qilindi")
+    await edit_or_send_message(
+        callback,
+        "Amal bekor qilindi.",
+        reply_markup=kb_main_inline()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_toggle_class:"))
+async def admin_toggle_class_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    state = admin_broadcast_state.get(chat_id)
+
+    await callback.answer()
+
+    if not state or state.get("mode") != "class_select_inline":
+        return
+
+    class_name = callback.data.split(":", 1)[1].upper()
+    available_classes = state.get("available_classes", [])
+    selected_classes = state.get("selected_classes", [])
+
+    if class_name not in available_classes:
+        return
+
+    if class_name in selected_classes:
+        selected_classes.remove(class_name)
+    else:
+        selected_classes.append(class_name)
+
+    state["selected_classes"] = selected_classes
+    admin_broadcast_state[chat_id] = state
+
+    await edit_or_send_message(
+        callback,
+        "E'lon yuboriladigan sinflarni tanlang:",
+        reply_markup=kb_admin_classes_select(available_classes, selected_classes)
+    )
+
+
+@dp.callback_query(F.data == "admin_classes_done")
+async def admin_classes_done_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    state = admin_broadcast_state.get(chat_id)
+
+    await callback.answer()
+
+    if not state or state.get("mode") != "class_select_inline":
+        return
+
+    selected_classes = state.get("selected_classes", [])
+
+    if not selected_classes:
+        await callback.answer("Kamida bitta sinfni tanlang.", show_alert=True)
+        return
+
+    admin_broadcast_state[chat_id] = {
+        "mode": "class_message",
+        "classes": selected_classes
+    }
+
+    await edit_or_send_message(
+        callback,
+        f"{', '.join(selected_classes)} sinflariga yuboriladigan xabarni kiriting."
+    )
+
+# --------------------------------------------------
+# HANDLERS: MESSAGES
+# --------------------------------------------------
 @dp.message()
 async def handle_message(message: types.Message):
     chat_id = message.chat.id
     text = (message.text or "").strip()
 
-    # -------------------------
-    # FEEDBACK STATE
-    # -------------------------
-    if chat_id in feedback_state:
-        state = feedback_state[chat_id]
-        subjects = state["subjects"]
+    state = get_feedback_state(chat_id)
+    if state:
+        if state.get("poll_date") == today_date_str():
+            await message.answer("Iltimos, so‘rovnomaga tugmalar orqali javob bering.")
+        else:
+            remove_feedback_state(chat_id)
+            await message.answer("So‘rovnoma yopilgan yoki muddati tugagan.")
+        return
 
-        if text not in subjects:
-            await message.answer("Iltimos, tugmalardan birini tanlang.")
-            return
+    if chat_id in registration_state:
+        await message.answer("Iltimos, sinfni tugmalar orqali tanlang.")
+        return
 
-        if state["step"] == "best":
-            state["best"] = text
-            state["step"] = "worst"
-
-            keyboard = build_subject_keyboard(subjects)
-
-            await message.answer(
-                "Bugun qaysi fan eng qiyin yoki yoqmagan bo‘ldi?",
-                reply_markup=keyboard
-            )
-            return
-
-        if state["step"] == "worst":
-            best = state["best"]
-            worst = text
-            user_class = state["class"]
-
-            save_feedback(chat_id, user_class, best, worst)
-            feedback_state.pop(chat_id, None)
-
-            await message.answer(
-                "Rahmat! Sizning fikringiz saqlandi.",
-                reply_markup=kb_main
-            )
-            return
-
-    # -------------------------
-    # ADMIN STATE
-    # -------------------------
     if chat_id in admin_broadcast_state:
         state = admin_broadcast_state[chat_id]
         mode = state.get("mode")
@@ -624,50 +1173,6 @@ async def handle_message(message: types.Message):
             sent_count = await broadcast_to_all_users(text)
             admin_broadcast_state.pop(chat_id, None)
             await message.answer(f"Xabar barcha foydalanuvchilarga yuborildi. Jami: {sent_count} ta.")
-            return
-
-        if mode == "class_select":
-            classes_input = text.upper().replace(" ", "")
-            target_classes = [c for c in classes_input.split(",") if c]
-
-            if not target_classes:
-                await message.answer("Iltimos, kamida bitta sinf kiriting. Masalan: 8A yoki 8A,8B")
-                return
-
-            valid_classes = []
-            invalid_classes = []
-
-            for c in target_classes:
-                if class_exists_in_schedule(c):
-                    valid_classes.append(c)
-                else:
-                    invalid_classes.append(c)
-
-            if invalid_classes:
-                await message.answer(
-                    f"Quyidagi sinflar topilmadi: {', '.join(invalid_classes)}"
-                )
-                return
-
-            if not is_superadmin(chat_id):
-                allowed = get_admin_allowed_classes(chat_id)
-
-                for c in valid_classes:
-                    if c not in allowed:
-                        await message.answer(
-                            f"Siz {c} sinfiga xabar yubora olmaysiz.\n"
-                            f"Ruxsat etilgan sinflar: {', '.join(allowed)}"
-                        )
-                        return
-
-            admin_broadcast_state[chat_id] = {
-                "mode": "class_message",
-                "classes": valid_classes
-            }
-
-            await message.answer(
-                f"{', '.join(valid_classes)} sinflariga yuboriladigan xabarni kiriting."
-            )
             return
 
         if mode == "class_message":
@@ -681,66 +1186,24 @@ async def handle_message(message: types.Message):
             )
             return
 
-    # -------------------------
-    # USER FLOW
-    # -------------------------
+        if mode == "class_select_inline":
+            await message.answer("Iltimos, sinflarni tugmalar orqali tanlang.")
+            return
+
     user_class = get_user_class(chat_id)
 
     if not user_class:
-        if text in [BTN_TODAY, BTN_TOMORROW, BTN_WEEKLY]:
-            await message.answer("Iltimos, avval sinfingizni yozing. Masalan: 8A")
-            return
-
-        if text.startswith("/"):
-            await message.answer("Avval sinfingizni kiriting. Masalan: 8A")
-            return
-
-        if len(text) > 10 or " " in text:
-            await message.answer(
-                "Sinf noto‘g‘ri kiritildi.\n"
-                "Iltimos, sinfni quyidagicha kiriting: 8A"
-            )
-            return
-
-        new_class = text.upper()
-
-        if not class_exists_in_schedule(new_class):
-            existing_classes = get_existing_classes()
-            preview = ", ".join(existing_classes[:10]) if existing_classes else "Mavjud sinflar topilmadi"
-
-            await message.answer(
-                f"{new_class} sinfi jadvalda topilmadi.\n"
-                f"Iltimos, sinfni to‘g‘ri kiriting. Masalan: 8A\n\n"
-                f"Ba'zi mavjud sinflar: {preview}"
-            )
-            return
-
-        save_user_class(chat_id, new_class)
+        registration_state[chat_id] = {"step": "choose_number"}
         await message.answer(
-            f"{new_class} sinfi saqlandi.\n"
-            f"Endi bot har kuni soat 07:00 da bugungi jadvalni, 14:00 da so‘rovnomani va 20:00 da ertangi jadvalni yuboradi.",
-            reply_markup=kb_main
+            "Avval sinfingizni tanlang:",
+            reply_markup=kb_registration_numbers()
         )
         return
 
-    if text == BTN_TODAY:
-        today_day_uz = get_today_day_uz()
-        response = format_schedule_for_day(user_class, today_day_uz)
-        await message.answer(response, reply_markup=kb_main)
-        return
-
-    if text == BTN_TOMORROW:
-        tomorrow_day_uz = get_tomorrow_day_uz()
-        response = format_schedule_for_day(user_class, tomorrow_day_uz)
-        await message.answer(response, reply_markup=kb_main)
-        return
-
-    if text == BTN_WEEKLY:
-        response = format_weekly_schedule(user_class)
-        await message.answer(response, reply_markup=kb_main)
-        return
-
-    await message.answer("Pastdagi tugmalardan foydalaning.", reply_markup=kb_main)
+    await message.answer(
+        "Kerakli bo‘limni tanlang:",
+        reply_markup=kb_main_inline()
+    )
 
 # --------------------------------------------------
 # RUN
@@ -748,14 +1211,15 @@ async def handle_message(message: types.Message):
 async def main():
     ensure_users_header()
     load_schedule_to_cache()
+    load_users_to_cache()
+    load_admins_to_cache()
+    load_feedback_state()
 
-    # agar webhook yoqilgan bo‘lsa, o‘chirib polling bilan ishga tushiramiz
     await bot.delete_webhook(drop_pending_updates=False)
 
     asyncio.create_task(refresh_schedule_cache_every_hour())
-    asyncio.create_task(send_today_schedule())
-    asyncio.create_task(send_daily_feedback_poll())
-    asyncio.create_task(send_tomorrow_schedule())
+    asyncio.create_task(refresh_users_and_admins_cache_every_5_minutes())
+    asyncio.create_task(scheduler_loop())
 
     await dp.start_polling(bot)
 
